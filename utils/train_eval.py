@@ -2,55 +2,233 @@ import time
 import os
 import torch
 import torch.nn.functional as F
+import numpy as np
+import tqdm
+import openmesh as om
 
+DEEPCONTACT_BIN_WEIGHTS_FILE = 'data/class_bin_weights.out'
+DEEPCONTACT_NUM_BINS = 10
 
-def run(model, train_loader, test_loader, epochs, optimizer, scheduler, writer,
+def run(model, train_loader, train_loader_hoi, test_loader, test_loader_hoi, epochs, optimizer, scheduler, writer, meshdata,exp_name,
         device):
     train_losses, test_losses = [], []
 
     for epoch in range(1, epochs + 1):
         t = time.time()
-        train_loss = train(model, optimizer, train_loader, device)
+        train_loss, train_l1, train_contact_loss, train_mano_l1, train_taxonomy_loss = train(model, optimizer, train_loader, train_loader_hoi, meshdata, device)
         t_duration = time.time() - t
-        test_loss = test(model, test_loader, device)
+        test_loss, test_l1, test_contact_loss, test_mano_l1, acc, test_taxonomy_loss, taxonomy_acc = test(model, test_loader, test_loader_hoi, epoch, meshdata,exp_name, device)
         scheduler.step()
         info = {
             'current_epoch': epoch,
             'epochs': epochs,
             'train_loss': train_loss,
             'test_loss': test_loss,
-            't_duration': t_duration
-        }
+            't_duration': t_duration,
+            'train_l1' : train_l1,
+            'train_mano_l1' : train_mano_l1,
+            'train_contact_loss' : train_contact_loss,
+            'test_l1' : train_l1,
+            'test_mano_l1' : test_mano_l1,
+            'test_contact_loss' : test_contact_loss,
+            'acc' : acc,
+            'train_taxonomy_loss' : train_taxonomy_loss,
+            'test_taxonomy_loss' : test_taxonomy_loss,
+            'taxonomy_acc' : taxonomy_acc
 
+        }
         writer.print_info(info)
+        print(info)
         writer.save_checkpoint(model, optimizer, scheduler, epoch)
 
 
-def train(model, optimizer, loader, device):
+def train(model, optimizer,  train_loader, train_loader_hoi, meshdata, device):
+
     model.train()
 
     total_loss = 0
-    for data in loader:
+    total_l1_loss = 0
+    total_contact_loss = 0
+    total_l1_mano_loss = 0
+    total_taxonomy_loss = 0
+
+    # train_loss, train_l1, train_contact_loss, train_mano_l1
+
+    for hoi, hand_mesh in zip( tqdm.tqdm(train_loader_hoi), train_loader):    
+        
         optimizer.zero_grad()
-        x = data.x.to(device)
-        out = model(x)
-        loss = F.l1_loss(out, x, reduction='mean')
+        x = hand_mesh.x.to(device)
+        x_feature = hoi[1].float().to(device)
+
+        x = torch.cat((x,x_feature),dim=2)
+
+        out, pred_taxonomy, verts = model(x)
+
+        contact_hand = out[:,:,3:13]
+
+        gt_contact_map = val_to_class(hoi[2]).squeeze(2).long().to(device)
+
+        bin_weights = torch.Tensor(np.loadtxt(DEEPCONTACT_BIN_WEIGHTS_FILE)).to(device)
+        criterion = torch.nn.CrossEntropyLoss(weight=bin_weights)
+        criterion_taxonomy = torch.nn.CrossEntropyLoss()
+
+        contact_classify_loss = criterion(contact_hand.permute(0, 2, 1), gt_contact_map)
+
+        taxonomy_loss = criterion_taxonomy(pred_taxonomy,(hoi[3] - 1).to(device))
+
+        total_contact_loss += contact_classify_loss
+        total_taxonomy_loss += taxonomy_loss
+
+        verts = verts / 1000
+        
+        mean = meshdata.mean.unsqueeze(0).to(device)
+        std  = meshdata.std.unsqueeze(0).to(device)
+
+        normalized_verts = (verts - mean) / std
+
+        l1_loss = F.l1_loss(out[:,:,:3], x[:,:,:3], reduction='mean')
+        l1_mano_loss = F.l1_loss(normalized_verts[:,:,:3], x[:,:,:3], reduction='mean')
+
+        loss = l1_loss + l1_mano_loss + contact_classify_loss + taxonomy_loss
+        total_l1_loss += l1_loss
+        total_l1_mano_loss += l1_mano_loss
+
         loss.backward()
-        total_loss += loss.item()
+
+        total_loss += loss
         optimizer.step()
-    return total_loss / len(loader)
+
+        #print(l1_loss,l1_mano_loss,contact_classify_loss)
+        
+    return total_loss / len(train_loader), total_l1_loss / len(train_loader), total_contact_loss / len(train_loader), total_l1_mano_loss / len(train_loader),  total_taxonomy_loss / len(train_loader)
+
+def val_to_class(val):
+
+    """
+
+    Converts a contact value [0-1] to a class assignment
+
+    :param val: tensor (batch, verts)
+
+    :return: class assignment (batch, verts)
+
+    """
+
+    expanded = torch.floor(val * DEEPCONTACT_NUM_BINS)
+
+    return torch.clamp(expanded, 0, DEEPCONTACT_NUM_BINS - 1).long() # Cut off potential 1.0 inputs?
+
+def class_to_val(raw_scores):
+
+    """
+
+    Finds the highest softmax for each class
+
+    :param raw_scores: tensor (batch, verts, classes)
+
+    :return: highest class (batch, verts)
+
+    """
+
+    cls = torch.argmax(raw_scores, dim=2)
+
+    val = (cls + 0.5) / DEEPCONTACT_NUM_BINS
+
+    return val
 
 
-def test(model, loader, device):
+def test(model, test_loader, test_loader_hoi, epoch, meshdata, exp_name,device):
     model.eval()
 
     total_loss = 0
+    total_l1_loss = 0
+    total_contact_loss = 0
+    total_l1_mano_loss = 0
+    total_acc_g = 0
+    total_taxonomy_loss = 0
+    total_taxonomy_acr = 0
+
+    #test_taxonomy_loss, taxonomy_acc
+
+    rendering_first = True
+    
     with torch.no_grad():
-        for i, data in enumerate(loader):
-            x = data.x.to(device)
-            pred = model(x)
-            total_loss += F.l1_loss(pred, x, reduction='mean')
-    return total_loss / len(loader)
+        for hoi, hand_mesh in zip( tqdm.tqdm(test_loader_hoi), test_loader): 
+            
+            x = hand_mesh.x.to(device)
+            x_feature = hoi[1].float().to(device)
+
+            # add input contact features
+            x = torch.cat((x,x_feature),dim=2)
+
+            pred, pred_taxonomy, mano_pred = model(x)
+
+            contact_hand = pred[:,:,3:13]
+            gt_contact_map = val_to_class(hoi[2]).squeeze(2).long().to(device)
+
+            bin_weights = torch.Tensor(np.loadtxt(DEEPCONTACT_BIN_WEIGHTS_FILE)).to(device)
+            criterion = torch.nn.CrossEntropyLoss(weight=bin_weights)
+            criterion_taxonomy = torch.nn.CrossEntropyLoss()
+
+            taxonomy_loss = criterion_taxonomy(pred_taxonomy,(hoi[3] -1).to(device))
+            total_taxonomy_loss += taxonomy_loss
+
+            contact_classify_loss = criterion(contact_hand.permute(0, 2, 1), gt_contact_map)
+            total_contact_loss += contact_classify_loss
+
+            acc_g = (contact_hand.permute(0, 2, 1).cpu().data.numpy().argmax(1) == gt_contact_map.cpu().data.numpy()).mean()
+
+            total_acc_g += acc_g 
+
+            acc_taxonomy = (pred_taxonomy.cpu().data.numpy().argmax(1) == (hoi[3]-1).numpy()).mean()
+            total_taxonomy_acr += acc_taxonomy
+
+            mano_pred = mano_pred / 1000
+
+            mean = meshdata.mean.unsqueeze(0).to(device)
+            std  = meshdata.std.unsqueeze(0).to(device)
+
+            normalized_verts = (mano_pred - mean) / std
+
+            if rendering_first :
+
+                ############### epoch ##############
+
+                ########## Rendering Results #######
+
+                # contact_hand.shape
+                verts = pred[:,:,:3]                
+
+                save_path = f'/scratch/minjay/coma/out/{exp_name}/mesh_results/{epoch}/'
+                if not os.path.exists(save_path):
+                    os.makedirs(save_path)
+                
+                hand_face = meshdata.template_face
+
+                for hand_idx in range(verts.shape[0]) :
+                    
+                    hand_mesh_verts = verts[hand_idx,:,:].cpu()
+                    hand_mesh_verts = hand_mesh_verts * meshdata.std + meshdata.mean
+ 
+                    om.write_mesh( save_path + f'verts_{hand_idx}.obj', om.TriMesh(hand_mesh_verts.numpy(),hand_face ))
+
+                    hand_mesh_verts = mano_pred[hand_idx,:,:].cpu() 
+                    
+                    om.write_mesh( save_path + f'verts_mano_{hand_idx}.obj', om.TriMesh(hand_mesh_verts.numpy(),hand_face ))
+
+
+                rendering_first = False
+
+            l1_loss = F.l1_loss(pred[:,:,:3], x[:,:,:3], reduction='mean')
+            l1_mano_loss = F.l1_loss(normalized_verts[:,:,:3], x[:,:,:3], reduction='mean')
+
+            total_l1_loss += l1_loss
+            #total_contact_loss = 0
+            total_l1_mano_loss += l1_mano_loss
+            
+            total_loss = total_loss + l1_loss.item() + l1_mano_loss.item() + contact_classify_loss.item() + taxonomy_loss.item()
+            
+    return  total_loss / len(test_loader), total_l1_loss / len(test_loader), total_contact_loss / len(test_loader), total_l1_mano_loss / len(test_loader), total_acc_g / len(test_loader), total_taxonomy_acr / len(test_loader), total_taxonomy_loss / len(test_loader)
 
 
 def eval_error(model, test_loader, device, meshdata, out_dir):
